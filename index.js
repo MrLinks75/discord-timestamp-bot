@@ -12,7 +12,9 @@ const crypto = require('crypto');
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages, // Added DirectMessages intent
+    GatewayIntentBits.GuildMessages   // Added GuildMessages intent
   ]
 });
 
@@ -21,6 +23,42 @@ const DATA_DIR = path.join(__dirname, 'data');
 const EVENTS_FILE = path.join(DATA_DIR, 'events.json');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 const USER_DATA_FILE = path.join(DATA_DIR, 'user_data.json');
+
+// Timezone Aliases Map
+const TIMEZONE_ALIASES = Object.freeze({
+  'EST': 'America/New_York',
+  'EDT': 'America/New_York',
+  'CST': 'America/Chicago',
+  'CDT': 'America/Chicago',
+  'MST': 'America/Denver',
+  'MDT': 'America/Denver',
+  'PST': 'America/Los_Angeles',
+  'PDT': 'America/Los_Angeles',
+  'AKST': 'America/Anchorage',
+  'AKDT': 'America/Anchorage',
+  'HST': 'Pacific/Honolulu',
+  'AST': 'America/Halifax', // Atlantic Standard Time
+  'ADT': 'America/Halifax', // Atlantic Daylight Time
+  'GMT': 'Etc/GMT',
+  'UTC': 'Etc/UTC', // Ensure UTC is also handled, though moment often does.
+  'BST': 'Europe/London', // British Summer Time
+  'CET': 'Europe/Berlin', // Central European Time
+  'CEST': 'Europe/Berlin', // Central European Summer Time
+  'EET': 'Europe/Helsinki', // Eastern European Time
+  'EEST': 'Europe/Helsinki', // Eastern European Summer Time
+  'IST': 'Asia/Kolkata',   // Indian Standard Time
+  'JST': 'Asia/Tokyo',     // Japan Standard Time
+  'AEST': 'Australia/Sydney',// Australian Eastern Standard Time
+  'AEDT': 'Australia/Sydney',// Australian Eastern Daylight Time
+  // Add more common aliases as needed
+});
+
+// Helper function to resolve timezone alias
+function resolveTimezoneAlias(timezoneInput) {
+  if (!timezoneInput) return null;
+  const upperCaseInput = timezoneInput.toUpperCase();
+  return TIMEZONE_ALIASES[upperCaseInput] || timezoneInput;
+}
 
 // Command registration
 const commands = [
@@ -89,7 +127,7 @@ const commands = [
         
   // EVENT MANAGEMENT COMMANDS
   
-  // Create event command (admin only) - Modified for simpler usage
+  // Create event command (admin only) - Modified to add role mention
   new SlashCommandBuilder()
     .setName('create-event')
     .setDescription('Create a new event (Admin only)')
@@ -122,12 +160,16 @@ const commands = [
       option.setName('max_participants')
         .setDescription('Maximum number of participants (0 for unlimited)')
         .setRequired(false))
+    .addUserOption(option =>  // Changed from addRoleOption to addUserOption
+      option.setName('mention')
+        .setDescription('User to mention when announcing the event')
+        .setRequired(false))
     .addStringOption(option =>
       option.setName('color')
         .setDescription('Color for the event embed (hex code)')
         .setRequired(false)),
 
-  // Quick event creation command
+  // Quick event creation command - Modified to add role mention
   new SlashCommandBuilder()
     .setName('quick-event')
     .setDescription('Quickly create an event with minimal info')
@@ -135,7 +177,32 @@ const commands = [
     .addStringOption(option => 
       option.setName('name_and_time')
         .setDescription('Event name and time (e.g., "Game Night tomorrow 8pm")')
-        .setRequired(true)),
+        .setRequired(true))
+    .addUserOption(option =>  // Changed from addRoleOption to addUserOption
+      option.setName('mention')
+        .setDescription('User to mention when announcing the event')
+        .setRequired(false)),
+
+  // Add a command for testing DMs
+  new SlashCommandBuilder()
+    .setName('test-dm')
+    .setDescription("Test direct message reminders for an event you are RSVP'd to.")
+    .addStringOption(option =>
+      option.setName('event_id')
+        .setDescription('The ID of the event to test DMs for.')
+        .setRequired(true)
+        .setAutocomplete(true)),
+        
+  // Add force-reminder command (Admin or Event Creator only)
+  new SlashCommandBuilder()
+    .setName('force-reminder')
+    .setDescription('Manually send a reminder DM to all participants of an event.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator) // Base permission
+    .addStringOption(option =>
+      option.setName('event_id')
+        .setDescription('The ID of the event to send reminders for.')
+        .setRequired(true)
+        .setAutocomplete(true)),
         
   // List events command
   new SlashCommandBuilder()
@@ -200,6 +267,10 @@ const commands = [
     .addIntegerOption(option =>
       option.setName('max_participants')
         .setDescription('New maximum number of participants (0 for unlimited)')
+        .setRequired(false))
+    .addUserOption(option =>  // Changed from addRoleOption to addUserOption
+      option.setName('mention')
+        .setDescription('User to mention when announcing the event')
         .setRequired(false))
 ].map(command => command.toJSON());
 
@@ -383,12 +454,18 @@ async function loadEvents() {
             description: decryptedData.description,
             location: decryptedData.location,
             participants: decryptedData.participants,
-            encryptedData: undefined // Remove the encrypted data field
+            encryptedData: undefined, // Remove the encrypted data field
+            startNotified: encryptedEvent.startNotified || false, // Add default for startNotified
+            channelId: encryptedEvent.channelId || null // Add channelId, default to null
           });
         }
       } else {
         // Backward compatibility for unencrypted data
-        events.set(id, encryptedEvent);
+        events.set(id, {
+            ...encryptedEvent,
+            startNotified: encryptedEvent.startNotified || false, // Add default for startNotified
+            channelId: encryptedEvent.channelId || null // Add channelId, default to null
+        });
       }
     }
     
@@ -435,7 +512,9 @@ async function saveEvents() {
         // Remove the unencrypted fields that are now encrypted
         description: '[ENCRYPTED]',
         location: event.location ? '[ENCRYPTED]' : null,
-        participants: [] // Don't store participants in plain text
+        participants: [], // Don't store participants in plain text
+        channelId: event.channelId, // Ensure channelId is saved
+        startNotified: event.startNotified || false // Ensure startNotified is saved
       };
       
       eventsArray.push([id, eventToSave]);
@@ -544,6 +623,8 @@ async function recoverFromBackup() {
 
 // Helper function to parse time input
 function parseTimeInput(timeInput, dateInput, timezone) {
+  const resolvedTimezone = resolveTimezoneAlias(timezone) || 'UTC'; // Default to UTC if unresolved
+
   // Handle the different formats of time input
   if (timeInput.toLowerCase() === 'now') {
     // Current time
@@ -566,11 +647,11 @@ function parseTimeInput(timeInput, dateInput, timezone) {
     
     // Handle date strings
     if (dateInput.toLowerCase() === 'today') {
-      momentObj = moment.tz(timezone);
+      momentObj = moment.tz(resolvedTimezone);
     } else if (dateInput.toLowerCase() === 'tomorrow') {
-      momentObj = moment.tz(timezone).add(1, 'days');
+      momentObj = moment.tz(resolvedTimezone).add(1, 'days');
     } else if (dateInput.toLowerCase() === 'yesterday') {
-      momentObj = moment.tz(timezone).subtract(1, 'days');
+      momentObj = moment.tz(resolvedTimezone).subtract(1, 'days');
     } else {
       // Try to parse as a specific date
       momentObj = moment.tz(dateInput, [
@@ -579,7 +660,7 @@ function parseTimeInput(timeInput, dateInput, timezone) {
         'DD/MM/YYYY',
         'MM-DD-YYYY',
         'DD-MM-YYYY'
-      ], timezone);
+      ], resolvedTimezone);
       
       if (!momentObj.isValid()) {
         throw new Error('Invalid date format');
@@ -606,26 +687,26 @@ function parseTimeInput(timeInput, dateInput, timezone) {
     
     if (/^\d{1,2}:\d{2}(AM|PM|am|pm)$/.test(timeInput)) {
       // Format like "3:14AM" or "3:14PM"
-      parsedTime = moment.tz(timeInput.toUpperCase(), ['h:mmA'], timezone);
+      parsedTime = moment.tz(timeInput.toUpperCase(), ['h:mmA'], resolvedTimezone);
     } else if (/^\d{1,2}:\d{2} (AM|PM|am|pm)$/.test(timeInput)) {
       // Format like "3:14 AM" or "3:14 PM"
-      parsedTime = moment.tz(timeInput.toUpperCase(), ['h:mm A'], timezone);
+      parsedTime = moment.tz(timeInput.toUpperCase(), ['h:mm A'], resolvedTimezone);
     } else if (/^\d{1,2}(AM|PM|am|pm)$/.test(timeInput)) {
       // Format like "3AM" or "3PM"
-      parsedTime = moment.tz(timeInput.toUpperCase(), ['hA'], timezone);
+      parsedTime = moment.tz(timeInput.toUpperCase(), ['hA'], resolvedTimezone);
     } else if (/^\d{1,2} (AM|PM|am|pm)$/.test(timeInput)) {
       // Format like "3 AM" or "3 PM"
-      parsedTime = moment.tz(timeInput.toUpperCase(), ['h A'], timezone);
+      parsedTime = moment.tz(timeInput.toUpperCase(), ['h A'], resolvedTimezone);
     } else if (/^\d{1,2}:\d{2}$/.test(timeInput)) {
       // Format like "15:23" or "3:14"
-      parsedTime = moment.tz(timeInput, ['HH:mm', 'h:mm'], timezone);
+      parsedTime = moment.tz(timeInput, ['HH:mm', 'h:mm'], resolvedTimezone);
     } else if (/^\d{3,4}$/.test(timeInput)) {
       // Military time format like "1520" for 15:20
       const militaryFormat = timeInput.length === 3 ? '0' + timeInput : timeInput;
-      parsedTime = moment.tz(militaryFormat, ['HHmm'], timezone);
+      parsedTime = moment.tz(militaryFormat, ['HHmm'], resolvedTimezone);
     } else {
       // Try all supported formats
-      parsedTime = moment.tz(timeInput, timeFormats, timezone);
+      parsedTime = moment.tz(timeInput, timeFormats, resolvedTimezone);
     }
     
     if (!parsedTime.isValid()) {
@@ -643,6 +724,7 @@ function parseTimeInput(timeInput, dateInput, timezone) {
 
 // Helper function to parse combined date-time inputs
 function parseTimeString(timeInput, userTimezone) {
+  const resolvedUserTimezone = resolveTimezoneAlias(userTimezone) || 'UTC';
   // Check if the time string contains date information
   const containsDate = /tomorrow|today|yesterday|\d{1,2}\/\d{1,2}|\d{4}-\d{1,2}-\d{1,2}/.test(timeInput.toLowerCase());
   
@@ -683,7 +765,7 @@ function parseTimeString(timeInput, userTimezone) {
       }
       
       // Use our existing parser with the extracted parts
-      return parseTimeInput(timePart, datePart, userTimezone);
+      return parseTimeInput(timePart, datePart, resolvedUserTimezone);
     }
   }
   
@@ -715,12 +797,12 @@ function parseTimeString(timeInput, userTimezone) {
   
   // If no date information in the string, assume today
   if (!containsDate) {
-    return parseTimeInput(timeInput, 'today', userTimezone);
+    return parseTimeInput(timeInput, 'today', resolvedUserTimezone);
   }
   
   // If it doesn't match any pattern, pass it through to the normal parser
   // and let it handle whatever it can
-  return parseTimeInput(timeInput, null, userTimezone);
+  return parseTimeInput(timeInput, null, resolvedUserTimezone);
 }
 
 // Create an embed for an event
@@ -736,1015 +818,1222 @@ function createEventEmbed(eventId, event) {
       { name: 'Created by', value: `<@${event.createdBy}>`, inline: true }
     );
   
-  if (event.location) {
-    embed.addFields({ name: 'Location', value: event.location, inline: true });
-  }
-  
-  // Add participation info
-  const participantsCount = event.participants ? event.participants.length : 0;
-  const maxParticipants = event.maxParticipants || 'Unlimited';
-  
-  let participantsField = `${participantsCount} attending`;
-  if (event.maxParticipants > 0) {
-    participantsField += ` / ${event.maxParticipants} maximum`;
-  }
-  
-  embed.addFields({ name: 'Participants', value: participantsField, inline: true });
-  
-  // Add participant list if there are any
- if (participantsCount > 0) {
-    const participantList = event.participants
-      .map(userId => `<@${userId}>`)
-      .join('\n');
-    
-    embed.addFields({ name: 'Attendees', value: participantList.slice(0, 1024) });
-  }
-  
-  // Add event ID as footer
-  embed.setFooter({ text: `Event ID: ${eventId} • Created at: ${new Date(event.createdAt).toLocaleString()}` });
-  
-  return embed;
- }
- 
- // Create event buttons (RSVP, Cancel RSVP)
- function createEventButtons(eventId, userId) {
-  const event = events.get(eventId);
-  if (!event) return null;
-  
-  const isParticipant = event.participants && event.participants.includes(userId);
-  const isFull = event.maxParticipants > 0 && event.participants.length >= event.maxParticipants;
-  
-  const row = new ActionRowBuilder();
-  
-  if (isParticipant) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`cancel_rsvp:${eventId}`)
-        .setLabel('Cancel RSVP')
-        .setStyle(ButtonStyle.Danger)
-    );
-  } else if (!isFull) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`rsvp:${eventId}`)
-        .setLabel('RSVP')
-        .setStyle(ButtonStyle.Success)
-    );
-  } else {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`rsvp:${eventId}`)
-        .setLabel('Event Full')
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(true)
-    );
-  }
-  
-  // Add reminder button
-  row.addComponents(
-    new ButtonBuilder()
-      .setCustomId(`remind:${eventId}`)
-      .setLabel('Set Reminder')
-      .setStyle(ButtonStyle.Primary)
-  );
-  
-  return row;
- }
- 
- // Helper function to get format names
- function formatName(format) {
-  const formats = {
-    't': 'Short Time',
-    'T': 'Long Time',
-    'd': 'Short Date',
-    'D': 'Long Date',
-    'f': 'Short Date/Time',
-    'F': 'Long Date/Time',
-    'R': 'Relative Time'
-  };
-  return formats[format] || 'Unknown Format';
- }
- 
- // Check for upcoming events to send reminders
- async function checkEventReminders() {
-  const now = Math.floor(Date.now() / 1000);
-  
-  for (const [eventId, event] of events.entries()) {
-    // If event is in the past, consider removing it
-    if (event.timestamp < now - 3600) { // Event ended more than an hour ago
-      // For now, we'll keep past events, but you could add auto-cleanup logic here
-      continue;
-    }
-    
-    // Check for reminders that need to be sent
-    const reminderTimes = [
-      { time: 30 * 60, label: '30 minutes' }, // 30 minutes before
-      { time: 60 * 60, label: '1 hour' },     // 1 hour before
-      { time: 24 * 60 * 60, label: '1 day' }  // 1 day before
-    ];
-    
-    for (const reminder of reminderTimes) {
-      const reminderTime = event.timestamp - reminder.time;
-      
-      // If it's time to send a reminder (within the last minute)
-      if (reminderTime > now - 60 && reminderTime <= now) {
-        await sendEventReminders(eventId, event, reminder.label);
+    if (event.location) {
+        embed.addFields({ name: 'Location', value: event.location, inline: true });
       }
-    }
-  }
- }
- 
- // Send reminders to participants
- async function sendEventReminders(eventId, event, timeLabel) {
-  if (!event.participants || event.participants.length === 0) return;
-  
-  // Create a reminder embed
-  const embed = new EmbedBuilder()
-    .setTitle(`⏰ Reminder: ${event.name} starts in ${timeLabel}!`)
-    .setDescription(event.description)
-    .setColor('#FF9900')
-    .addFields(
-      { name: 'Time', value: `<t:${event.timestamp}:F> (<t:${event.timestamp}:R>)`, inline: true }
-    );
-  
-  if (event.location) {
-    embed.addFields({ name: 'Location', value: event.location, inline: true });
-  }
-  
-  embed.setFooter({ text: `Event ID: ${eventId}` });
-  
-  // Try to send DMs to all participants
-  for (const userId of event.participants) {
-    try {
-      const user = await client.users.fetch(userId);
-      await user.send({ embeds: [embed] });
-      console.log(`Sent ${timeLabel} reminder to ${user.tag} for event ${eventId}`);
-    } catch (error) {
-      console.error(`Failed to send reminder to user ${userId}:`, error);
-    }
-  }
- }
- 
- // Register commands when the bot is ready
- client.once('ready', async () => {
-  console.log(`Logged in as ${client.user.tag}!`);
-  
-  try {
-    console.log('Started refreshing application (/) commands.');
-    
-    // The correct way to set application commands
-    await rest.put(
-      Routes.applicationCommands(client.user.id),
-      { body: commands },
-    );
- 
-    console.log('Successfully reloaded application (/) commands.');
-    
-    // Load user data and events from storage
-    await loadUserData();
-    await loadEvents();
-    
-    // Start checking for event reminders periodically
-    setInterval(checkEventReminders, 60000); // Check every minute
-    
-    // Regularly clean up old rate limit entries
-    setInterval(() => {
-      const now = Date.now();
-      for (const [key, limit] of rateLimits.entries()) {
-        const [userId, action] = key.split(':');
-        const limitConfig = RATE_LIMIT[action] || RATE_LIMIT.commands;
+      
+      // Add participation info
+      const participantsCount = event.participants ? event.participants.length : 0;
+      const maxParticipants = event.maxParticipants || 'Unlimited';
+      
+      let participantsField = `${participantsCount} attending`;
+      if (event.maxParticipants > 0) {
+        participantsField += ` / ${event.maxParticipants} maximum`;
+      }
+      
+      embed.addFields({ name: 'Participants', value: participantsField, inline: true });
+      
+      // Add participant list if there are any
+      if (participantsCount > 0) {
+        const participantList = event.participants
+          .map(userId => `<@${userId}>`)
+          .join('\n');
         
-        if (now - limit.timestamp > limitConfig.window * 1000) {
-          rateLimits.delete(key);
+        embed.addFields({ name: 'Attendees', value: participantList.slice(0, 1024) });
+      }
+      
+      // Add event ID as footer
+      embed.setFooter({ text: `Event ID: ${eventId} • Created at: ${new Date(event.createdAt).toLocaleString()}` });
+      
+      return embed;
+     }
+     
+     // Create event buttons (RSVP, Cancel RSVP) - Modified to fix button interaction issue
+     function createEventButtons(eventId) {
+      // Remove userId parameter since we don't want to customize buttons per user
+      const event = events.get(eventId);
+      if (!event) return null;
+      
+      const row = new ActionRowBuilder();
+      
+      // Always show both buttons but handle the logic in the button handler
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`rsvp:${eventId}`)
+          .setLabel('RSVP')
+          .setStyle(ButtonStyle.Success)
+      );
+      
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`cancel_rsvp:${eventId}`)
+          .setLabel('Cancel RSVP')
+          .setStyle(ButtonStyle.Danger)
+      );
+      
+      // Add reminder button
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`remind:${eventId}`)
+          .setLabel('Set Reminder')
+          .setStyle(ButtonStyle.Primary)
+      );
+      
+      return row;
+     }
+     
+     // Helper function to get format names
+     function formatName(format) {
+      const formats = {
+        't': 'Short Time',
+        'T': 'Long Time',
+        'd': 'Short Date',
+        'D': 'Long Date',
+        'f': 'Short Date/Time',
+        'F': 'Long Date/Time',
+        'R': 'Relative Time'
+      };
+      return formats[format] || 'Unknown Format';
+     }
+     
+     // Check for upcoming events to send reminders
+     async function checkEventReminders() {
+      const now = Math.floor(Date.now() / 1000);
+      
+      for (const [eventId, event] of events.entries()) {
+        // If event is in the past, consider removing it
+        if (event.timestamp < now - 3600) { // Event ended more than an hour ago
+          // For now, we'll keep past events, but you could add auto-cleanup logic here
+          continue;
         }
-      }
-    }, 60000); // Clean up every minute
-    
-    // Auto-save user data every 5 minutes
-    setInterval(async () => {
-      await saveUserData();
-    }, 300000);
-    
-    console.log(`Bot is ready and operational!`);
-    
-  } catch (error) {
-    console.error('Error during startup:', error);
-  }
- });
- 
- // Handle autocomplete interactions for event IDs
- client.on('interactionCreate', async interaction => {
-  if (!interaction.isAutocomplete()) return;
-  
-  const command = interaction.commandName;
-  const focusedOption = interaction.options.getFocused(true);
-  
-  if ((command === 'event' || command === 'delete-event' || command === 'edit-event') && 
-      focusedOption.name === 'id') {
-    try {
-      // Rate limiting for autocomplete to prevent abuse
-      if (!checkRateLimit(interaction.user.id, 'commands')) {
-        return await interaction.respond([]);
-      }
-      
-      // Filter events based on input
-      const eventChoices = [];
-      const input = focusedOption.value.toLowerCase();
-      
-      for (const [id, event] of events.entries()) {
-        // Only match events that contain the input in id or name
-        if (id.toLowerCase().includes(input) || event.name.toLowerCase().includes(input)) {
-          // Add event to choices (truncate name if too long)
-          const displayName = event.name.length > 50 ? 
-            event.name.substring(0, 47) + '...' : event.name;
+        
+        // Check if the event is starting now
+        if (event.timestamp <= now && event.timestamp > now - 60 && !event.startNotified) {
+          await sendEventStartNotification(eventId, event);
+          event.startNotified = true; // Mark that a start notification has been sent
+          events.set(eventId, event); // Update event in map
+          await saveEvents(); // Persist the change
+        }
+        
+        // Check for reminders that need to be sent
+        const reminderTimes = [
+          { time: 30 * 60, label: '30 minutes' }, // 30 minutes before
+          { time: 60 * 60, label: '1 hour' },     // 1 hour before
+          { time: 24 * 60 * 60, label: '1 day' }  // 1 day before
+        ];
+        
+        for (const reminder of reminderTimes) {
+          const reminderTime = event.timestamp - reminder.time;
           
-          eventChoices.push({
-            name: `${id}: ${displayName}`,
-            value: id
-          });
+          // If it's time to send a reminder (within the last minute)
+          if (reminderTime > now - 60 && reminderTime <= now) {
+            await sendEventReminders(eventId, event, reminder.label);
+          }
         }
-        
-        // Discord allows up to 25 choices
-        if (eventChoices.length >= 25) break;
+      }
+     }
+     
+     // Send reminders to participants
+     async function sendEventReminders(eventId, event, timeLabel) {
+      if (!event.participants || event.participants.length === 0) return;
+      
+      // Create a reminder embed
+      const embed = new EmbedBuilder()
+        .setTitle(`⏰ Reminder: ${event.name} starts in ${timeLabel}!`)
+        .setDescription(event.description)
+        .setColor('#FF9900')
+        .addFields(
+          { name: 'Time', value: `<t:${event.timestamp}:F> (<t:${event.timestamp}:R>)`, inline: true }
+        );
+      
+      if (event.location) {
+        embed.addFields({ name: 'Location', value: event.location, inline: true });
       }
       
-      await interaction.respond(eventChoices);
-    } catch (error) {
-      console.error('Error handling autocomplete:', error);
-      // Respond with empty array on error to avoid client-side issues
-      await interaction.respond([]);
-    }
-  }
- });
- 
- // Handle button interactions for events
- client.on('interactionCreate', async interaction => {
-  if (!interaction.isButton()) return;
-  
-  try {
-    // Rate limiting for button interactions
-    if (!checkRateLimit(interaction.user.id, 'commands')) {
-      return interaction.reply({ 
-        content: '⚠️ You are interacting too quickly. Please wait a moment and try again.',
-        ephemeral: true 
-      });
-    }
-    
-    const { customId, user } = interaction;
-    
-    // Parse button ID in format "action:eventId"
-    const [action, eventId] = customId.split(':');
-    
-    if (!eventId || !events.has(eventId)) {
-      return interaction.reply({ 
-        content: 'This event no longer exists.',
-        ephemeral: true 
-      });
-    }
-    
-    const event = events.get(eventId);
-    
-    switch (action) {
-      case 'rsvp':
-        // Handle RSVP button
-        if (!event.participants) {
-          event.participants = [];
-        }
-        
-        // Check if event is full
-        if (event.maxParticipants > 0 && event.participants.length >= event.maxParticipants) {
-          return interaction.reply({ 
-            content: 'Sorry, this event is already full.', 
-            ephemeral: true 
-          });
-        }
-        
-        // Check if user already RSVP'd
-        if (event.participants.includes(user.id)) {
-          return interaction.reply({ 
-            content: 'You have already RSVP\'d to this event.', 
-            ephemeral: true 
-          });
-        }
-        
-        // Add user to participants
-        event.participants.push(user.id);
-        await saveEvents();
-        
-        // Update the message with new participant info
+      embed.setFooter({ text: `Event ID: ${eventId}` });
+      
+      // Try to send DMs to all participants
+      for (const userId of event.participants) {
         try {
-          const embed = createEventEmbed(eventId, event);
-          const buttons = createEventButtons(eventId, user.id);
-          
-          await interaction.update({ 
-            embeds: [embed], 
-            components: buttons ? [buttons] : [] 
-          });
-          
-          // Also send a confirmation
-          await interaction.followUp({ 
-            content: `You've successfully RSVP'd to **${event.name}**! The event starts <t:${event.timestamp}:R>.`, 
-            ephemeral: true 
-          });
-          
-          console.log(`User ${user.tag} (${user.id}) RSVP'd to event ${eventId}`);
+          const user = await client.users.fetch(userId);
+          await user.send({ embeds: [embed] });
+          console.log(`Sent ${timeLabel} reminder to ${user.tag} for event ${eventId}`);
         } catch (error) {
-          console.error('Error updating RSVP:', error);
-          await interaction.reply({ 
-            content: 'Your RSVP was recorded, but there was an error updating the display.', 
-            ephemeral: true 
-          });
+          console.error(`Failed to send reminder to user ${userId}:`, error);
         }
-        break;
-        
-      case 'cancel_rsvp':
-        // Handle Cancel RSVP button
-        if (!event.participants || !event.participants.includes(user.id)) {
-          return interaction.reply({ 
-            content: 'You have not RSVP\'d to this event.', 
-            ephemeral: true 
-          });
+      }
+     }
+     
+     // Send event start notification
+     async function sendEventStartNotification(eventId, event) {
+      if (!event.participants || event.participants.length === 0) {
+        console.log(`Event ${eventId} (${event.name}) is starting, but has no participants to notify.`);
+        return;
+      }
+
+      if (!event.channelId) {
+        console.warn(`Event ${eventId} (${event.name}) is starting, but no channelId was stored. Cannot send channel announcement.`);
+        // Optionally, you could fall back to DMs here if desired, but per current request, we won't.
+        return;
+      }
+
+      try {
+        const channel = await client.channels.fetch(event.channelId);
+        if (!channel || !channel.isTextBased()) {
+          console.error(`Failed to fetch a valid text-based channel for event ${eventId} with channelId ${event.channelId}.`);
+          return;
         }
-        
-        // Remove user from participants
-        event.participants = event.participants.filter(id => id !== user.id);
-        await saveEvents();
-        
-        // Update the message with new participant info
-        try {
-          const embed = createEventEmbed(eventId, event);
-          const buttons = createEventButtons(eventId, user.id);
-          
-          await interaction.update({ 
-            embeds: [embed], 
-            components: buttons ? [buttons] : [] 
-          });
-          
-          // Also send a confirmation
-          await interaction.followUp({ 
-            content: `You've canceled your RSVP to **${event.name}**.`, 
-            ephemeral: true 
-          });
-          
-          console.log(`User ${user.tag} (${user.id}) canceled RSVP to event ${eventId}`);
-        } catch (error) {
-          console.error('Error updating RSVP:', error);
-          await interaction.reply({ 
-            content: 'Your RSVP was canceled, but there was an error updating the display.', 
-            ephemeral: true 
-          });
+
+        const participantMentions = event.participants.map(id => `<@${id}>`).join(' ');
+        const startMessageContent = `${participantMentions} The event **${event.name}** is starting now!`;
+
+        const embed = new EmbedBuilder()
+          .setTitle(`🎉 ${event.name} is starting now!`)
+          .setDescription(event.description || 'The event is beginning!')
+          .setColor(event.color || '#5865F2')
+          .addFields(
+            { name: 'Time', value: `<t:${event.timestamp}:F>`, inline: true }
+          );
+
+        if (event.location) {
+          embed.addFields({ name: 'Location', value: event.location, inline: true });
         }
-        break;
-        
-      case 'remind':
-        // Handle Set Reminder button
-        await interaction.reply({ 
-          content: `I've set a reminder for you for **${event.name}**. You'll receive a DM 1 day, 1 hour, and 30 minutes before the event starts.`, 
-          ephemeral: true 
-        });
-        
-        console.log(`User ${user.tag} (${user.id}) set reminders for event ${eventId}`);
-        break;
-    }
-  } catch (error) {
-    console.error('Error handling button interaction:', error);
-    await interaction.reply({ 
-      content: 'An error occurred while processing your request. Please try again later.', 
-      ephemeral: true 
-    });
-  }
- });
- 
- // Handle slash commands
- client.on('interactionCreate', async interaction => {
-  if (!interaction.isCommand()) return;
- 
-  try {
-    const { commandName, user } = interaction;
-    
-    // Security: Rate limiting
-    if (!checkRateLimit(user.id, 'commands')) {
-      return interaction.reply({ 
-        content: '⚠️ You are sending commands too quickly. Please wait a moment and try again.',
-        ephemeral: true 
-      });
-    }
-    
-    // Log command usage for security auditing
-    console.log(`Command executed: ${commandName} by ${user.tag} (${user.id})`);
-    
-    // Set user timezone command
-    if (commandName === 'set-timezone') {
-      const timezone = sanitizeInput(interaction.options.getString('timezone'));
-      
-      // Validate timezone
-      if (!timezone || !moment.tz.zone(timezone)) {
-        return interaction.reply({ 
-          content: `❌ Invalid timezone. Please use a valid timezone like 'America/New_York' or 'Europe/London'. See the full list at: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones`, 
-          ephemeral: true 
-        });
+        embed.setFooter({ text: `Event ID: ${eventId}` });
+
+        await channel.send({ content: startMessageContent, embeds: [embed] });
+        console.log(`Sent start announcement to channel ${channel.name} for event ${eventId}`);
+
+      } catch (error) {
+        console.error(`Failed to send start announcement for event ${eventId} to channel ${event.channelId}:`, error);
+        // Specific error handling for common issues
+        if (error.code === 10003) { // Unknown Channel
+          console.error(`Channel ${event.channelId} for event ${eventId} not found. Was it deleted?`);
+        } else if (error.code === 50013) { // Missing Permissions
+          console.error(`Missing permissions to send message in channel ${event.channelId} for event ${eventId}.`);
+        }
       }
-      
-      // Store user timezone
-      userTimezones.set(user.id, timezone);
-      await saveUserData();
-      
-      return interaction.reply({ 
-        content: `✅ Your timezone has been set to ${timezone}. All timestamp conversions will use this timezone.`, 
-        ephemeral: true 
-      });
-    }
- 
-    // Quick "now" command
-    if (commandName === 'now') {
-      const unixTimestamp = Math.floor(Date.now() / 1000);
-      const formats = ['t', 'T', 'd', 'D', 'f', 'F', 'R'];
-      const examples = formats.map(f => `**${formatName(f)}**: <t:${unixTimestamp}:${f}> (\`<t:${unixTimestamp}:${f}>\`)`);
-      
-      const response = [
-        `**Current Unix Timestamp**: \`${unixTimestamp}\``,
-        '**Available Formats**:',
-        ...examples
-      ].join('\n');
-      
-      return interaction.reply(response);
-    }
- 
-    // "In X time" command
-    if (commandName === 'in') {
-      // Security: Sanitize and validate inputs
-      const amount = Math.min(Math.max(1, interaction.options.getInteger('amount')), 1000);
-      const unit = interaction.options.getString('unit');
-      
-      const validUnits = ['minutes', 'hours', 'days', 'weeks', 'months'];
-      if (!validUnits.includes(unit)) {
-        return interaction.reply({ 
-          content: '❌ Invalid time unit.', 
-          ephemeral: true 
-        });
-      }
-      
-      const now = moment();
-      const futureTime = now.add(amount, unit);
-      const unixTimestamp = Math.floor(futureTime.valueOf() / 1000);
-      
-      const response = [
-        `**Timestamp ${amount} ${unit} from now**: <t:${unixTimestamp}:F> (\`<t:${unixTimestamp}:F>\`)`,
-        `**Relative**: <t:${unixTimestamp}:R> (\`<t:${unixTimestamp}:R>\`)`,
-        `**Unix Timestamp**: \`${unixTimestamp}\``
-      ].join('\n');
-      
-      return interaction.reply(response);
-    }
- 
-    // Main timestamp command
-    if (commandName === 'timestamp') {
-      // Security: Sanitize all inputs
-      const timeInput = sanitizeInput(interaction.options.getString('time'));
-      const format = sanitizeInput(interaction.options.getString('format')) || 'f';
-      let dateInput = interaction.options.getString('date') ? 
-                     sanitizeInput(interaction.options.getString('date')) : null;
-      let timezone = interaction.options.getString('timezone') ? 
-                    sanitizeInput(interaction.options.getString('timezone')) : null;
-      
-      // Validate format
-      const validFormats = ['t', 'T', 'd', 'D', 'f', 'F', 'R', 'all'];
-      if (!validFormats.includes(format)) {
-        return interaction.reply({
-          content: '❌ Invalid format specified.',
-          ephemeral: true
-        });
-      }
-      
-      // If no timezone provided, use the user's saved timezone or default to UTC
-      if (!timezone) {
-        timezone = userTimezones.get(user.id) || 'UTC';
-      }
+     }
+     
+     // Register commands when the bot is ready
+     client.once('ready', async () => {
+      console.log(`Logged in as ${client.user.tag}!`);
       
       try {
-        // Validate timezone
-        if (!moment.tz.zone(timezone)) {
+        console.log('Clearing application commands cache...');
+        await rest.put(
+          Routes.applicationCommands(client.user.id),
+          { body: [] } // Send an empty array to clear commands
+        );
+
+        console.log('Re-registering application commands...');
+        // The correct way to set application commands
+        await rest.put(
+          Routes.applicationCommands(client.user.id),
+          { body: commands },
+        );
+     
+        console.log('Successfully reloaded application (/) commands.');
+        
+        // Load user data and events from storage
+        await loadUserData();
+        await loadEvents();
+        
+        // Start checking for event reminders periodically
+        setInterval(checkEventReminders, 60000); // Check every minute
+        
+        // Regularly clean up old rate limit entries
+        setInterval(() => {
+          const now = Date.now();
+          for (const [key, limit] of rateLimits.entries()) {
+            const [userId, action] = key.split(':');
+            const limitConfig = RATE_LIMIT[action] || RATE_LIMIT.commands;
+            
+            if (now - limit.timestamp > limitConfig.window * 1000) {
+              rateLimits.delete(key);
+            }
+          }
+        }, 60000); // Clean up every minute
+        
+        // Auto-save user data every 5 minutes
+        setInterval(async () => {
+          await saveUserData();
+        }, 300000);
+        
+        console.log(`Bot is ready and operational!`);
+        
+      } catch (error) {
+        console.error('Error during startup:', error);
+      }
+     });
+     
+     // Handle autocomplete interactions for event IDs
+     client.on('interactionCreate', async interaction => {
+      if (!interaction.isAutocomplete()) return;
+      
+      const command = interaction.commandName;
+      const focusedOption = interaction.options.getFocused(true);
+      
+      // Updated to include 'test-dm' and 'force-reminder' and check for 'event_id'
+      if ((command === 'event' || command === 'delete-event' || command === 'edit-event' || 
+           command === 'test-dm' || command === 'force-reminder') && 
+          (focusedOption.name === 'id' || focusedOption.name === 'event_id')) {
+        try {
+          // Rate limiting for autocomplete to prevent abuse
+          if (!checkRateLimit(interaction.user.id, 'commands')) {
+            return await interaction.respond([]);
+          }
+          
+          // Filter events based on input
+          const eventChoices = [];
+          const input = focusedOption.value.toLowerCase();
+          
+          for (const [id, event] of events.entries()) {
+            // Only match events that contain the input in id or name
+            if (id.toLowerCase().includes(input) || event.name.toLowerCase().includes(input)) {
+              // Add event to choices (truncate name if too long)
+              const displayName = event.name.length > 50 ? 
+                event.name.substring(0, 47) + '...' : event.name;
+              
+              eventChoices.push({
+                name: `${id}: ${displayName}`,
+                value: id
+              });
+            }
+            
+            // Discord allows up to 25 choices
+            if (eventChoices.length >= 25) break;
+          }
+          
+          await interaction.respond(eventChoices);
+        } catch (error) {
+          console.error('Error handling autocomplete:', error);
+          // Respond with empty array on error to avoid client-side issues
+          await interaction.respond([]);
+        }
+      }
+     });
+     
+     // Handle button interactions for events - Modified to handle improved button flow
+     client.on('interactionCreate', async interaction => {
+      if (!interaction.isButton()) return;
+      
+      try {
+        // Rate limiting for button interactions
+        if (!checkRateLimit(interaction.user.id, 'commands')) {
           return interaction.reply({ 
-            content: `❌ Invalid timezone. Please use a valid timezone like 'America/New_York' or 'Europe/London'.`, 
+            content: '⚠️ You are interacting too quickly. Please wait a moment and try again.',
             ephemeral: true 
           });
         }
         
-        // Try parsing with combined date-time format first
-        let unixTimestamp;
-        if (!dateInput && timeInput !== 'now' && !/^\d+$/.test(timeInput)) {
-          // This might be a combined format like "tomorrow 8pm"
-          try {
-            unixTimestamp = parseTimeString(timeInput, timezone);
-          } catch (error) {
-            // If combined parsing fails, fall back to separate parsing
-            unixTimestamp = parseTimeInput(timeInput, dateInput, timezone);
-          }
-        } else {
-          // Use regular parsing for explicit date input or special cases
-          unixTimestamp = parseTimeInput(timeInput, dateInput, timezone);
+        const { customId, user } = interaction;
+        
+        // Parse button ID in format "action:eventId"
+        const [action, eventId] = customId.split(':');
+        
+        if (!eventId || !events.has(eventId)) {
+          return interaction.reply({ 
+            content: 'This event no longer exists.',
+            ephemeral: true 
+          });
         }
         
-        if (format === 'all') {
-          // Show all format options
+        const event = events.get(eventId);
+        
+        switch (action) {
+          case 'rsvp':
+            // Handle RSVP button
+            if (!event.participants) {
+              event.participants = [];
+            }
+            
+            // Check if event is full
+            if (event.maxParticipants > 0 && event.participants.length >= event.maxParticipants) {
+              return interaction.reply({ 
+                content: 'Sorry, this event is already full.', 
+                ephemeral: true 
+              });
+            }
+            
+            // Check if user already RSVP'd
+            if (event.participants.includes(user.id)) {
+              return interaction.reply({ 
+                content: "You have already RSVP'd to this event.", 
+                ephemeral: true 
+              });
+            }
+            
+            // Add user to participants
+            event.participants.push(user.id);
+            await saveEvents();
+            
+            // Update the message with new participant info
+            try {
+              const embed = createEventEmbed(eventId, event);
+              const buttons = createEventButtons(eventId); // No longer passing userId
+              
+              await interaction.update({ 
+                embeds: [embed], 
+                components: buttons ? [buttons] : [] 
+              });
+              
+              // Also send a confirmation
+              await interaction.followUp({ 
+                content: `You've successfully RSVP'd to **${event.name}**! The event starts <t:${event.timestamp}:R>. You'll receive reminders before it begins.`, 
+                ephemeral: true 
+              });
+              
+              console.log(`User ${user.tag} (${user.id}) RSVP'd to event ${eventId}`);
+            } catch (error) {
+              console.error('Error updating RSVP:', error);
+              await interaction.reply({ 
+                content: 'Your RSVP was recorded, but there was an error updating the display.', 
+                ephemeral: true 
+              });
+            }
+            break;
+            
+          case 'cancel_rsvp':
+            // Handle Cancel RSVP button
+            if (!event.participants || !event.participants.includes(user.id)) {
+              return interaction.reply({ 
+                content: "You have not RSVP'd to this event.", 
+                ephemeral: true 
+              });
+            }
+            
+            // Remove user from participants
+            event.participants = event.participants.filter(id => id !== user.id);
+            await saveEvents();
+            
+            // Update the message with new participant info
+            try {
+              const embed = createEventEmbed(eventId, event);
+              const buttons = createEventButtons(eventId); // No longer passing userId
+              
+              await interaction.update({ 
+                embeds: [embed], 
+                components: buttons ? [buttons] : [] 
+              });
+              
+              // Also send a confirmation
+              await interaction.followUp({ 
+                content: `You've canceled your RSVP to **${event.name}**.`, 
+                ephemeral: true 
+              });
+              
+              console.log(`User ${user.tag} (${user.id}) canceled RSVP to event ${eventId}`);
+            } catch (error) {
+              console.error('Error updating RSVP:', error);
+              await interaction.reply({ 
+                content: 'Your RSVP was canceled, but there was an error updating the display.', 
+                ephemeral: true 
+              });
+            }
+            break;
+            
+          case 'remind':
+            // Handle Set Reminder button
+            await interaction.reply({ 
+              content: `I've set a reminder for you for **${event.name}**. You'll receive a DM 1 day, 1 hour, and 30 minutes before the event starts.`, 
+              ephemeral: true 
+            });
+            
+            console.log(`User ${user.tag} (${user.id}) set reminders for event ${eventId}`);
+            break;
+        }
+      } catch (error) {
+        console.error('Error handling button interaction:', error);
+        await interaction.reply({ 
+          content: 'An error occurred while processing your request. Please try again later.', 
+          ephemeral: true 
+        });
+      }
+     });
+     
+     // Handle slash commands
+     client.on('interactionCreate', async interaction => {
+      if (!interaction.isCommand()) return;
+     
+      try {
+        const { commandName, user } = interaction;
+        
+        // Security: Rate limiting
+        if (!checkRateLimit(user.id, 'commands')) {
+          return interaction.reply({ 
+            content: '⚠️ You are sending commands too quickly. Please wait a moment and try again.',
+            ephemeral: true 
+          });
+        }
+        
+        // Log command usage for security auditing
+        console.log(`Command executed: ${commandName} by ${user.tag} (${user.id})`);
+        
+        // Set user timezone command
+        if (commandName === 'set-timezone') {
+          const timezone = sanitizeInput(interaction.options.getString('timezone'));
+          
+          // Validate timezone
+          if (!timezone || !moment.tz.zone(timezone)) {
+            return interaction.reply({ 
+              content: `❌ Invalid timezone. Please use a valid timezone like 'America/New_York' or 'Europe/London'. See the full list at: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones`, 
+              ephemeral: true 
+            });
+          }
+          
+          // Store user timezone
+          userTimezones.set(user.id, timezone);
+          await saveUserData();
+          
+          return interaction.reply({ 
+            content: `✅ Your timezone has been set to ${timezone}. All timestamp conversions will use this timezone.`, 
+            ephemeral: true 
+          });
+        }
+     
+        // Quick "now" command
+        if (commandName === 'now') {
+          const unixTimestamp = Math.floor(Date.now() / 1000);
           const formats = ['t', 'T', 'd', 'D', 'f', 'F', 'R'];
           const examples = formats.map(f => `**${formatName(f)}**: <t:${unixTimestamp}:${f}> (\`<t:${unixTimestamp}:${f}>\`)`);
           
-          const timezoneName = timezone || 'UTC';
           const response = [
-            `**Time in ${timezoneName}**: ${moment.unix(unixTimestamp).tz(timezoneName).format('YYYY-MM-DD HH:mm:ss')}`,
-            `**Unix Timestamp**: \`${unixTimestamp}\``,
-            '**Discord Timestamp Formats**:',
+            `**Current Unix Timestamp**: \`${unixTimestamp}\``,
+            '**Available Formats**:',
             ...examples
           ].join('\n');
           
           return interaction.reply(response);
         }
-        
-        // Generate timestamp for a specific format
-        const discordTimestamp = `<t:${unixTimestamp}:${format}>`;
-        const timezoneName = timezone || 'UTC';
-        const localTime = moment.unix(unixTimestamp).tz(timezoneName).format('YYYY-MM-DD HH:mm:ss');
-        
-        const response = [
-          `**Time in ${timezoneName}**: ${localTime}`,
-          `**${formatName(format)}**: ${discordTimestamp}`,
-          `**Copy this**: \`${discordTimestamp}\``,
-          `**Unix Timestamp**: \`${unixTimestamp}\``
-        ].join('\n');
-        
-        await interaction.reply(response);
-      } catch (error) {
-        console.error('Error generating timestamp:', error);
-        await interaction.reply({ 
-          content: `❌ Invalid time or date format. Examples of supported time formats:\n` +
-                  `- 3:14AM, 3:14 PM, 3PM, 3 PM\n` +
-                  `- 15:23 (24-hour format)\n` +
-                  `- 1520 (military time, no colon)\n` +
-                  `- now (current time)\n\n` +
-                  `Supported date formats:\n` +
-                  `- YYYY-MM-DD (e.g., 2023-05-20)\n` +
-                  `- MM/DD/YYYY (e.g., 05/20/2023)\n` +
-                  `- today, tomorrow, yesterday\n\n` +
-                  `Combined formats:\n` +
-                  `- tomorrow 8pm\n` +
-                  `- 3pm tomorrow`, 
-          ephemeral: true 
-        });
-      }
-    }
-    
-    // Quick event command
-    if (commandName === 'quick-event') {
-      // Security: Check permissions
-      if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageEvents) && 
-          !interaction.memberPermissions.has(PermissionFlagsBits.Administrator)) {
-        return interaction.reply({ 
-          content: '❌ You do not have permission to create events.',
-          ephemeral: true 
-        });
-      }
-      
-      const nameAndTime = sanitizeInput(interaction.options.getString('name_and_time'));
-      
-      // Try to parse the combined string into name and time
-      // Common patterns: "Game Night tomorrow 8pm", "Team Meeting at 3pm", etc.
-      const timePatterns = [
-        // Look for time patterns at the end
-        /\b((?:today|tomorrow|yesterday|in \d+ (?:minute|hour|day|week|month)s?|next (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))(?:\s+at)?\s+\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{1,2}(?::\d{2})?\s*[ap]m\s+(?:today|tomorrow|yesterday)|(?:\d{1,2}\/\d{1,2}|\d{4}-\d{1,2}-\d{1,2})\s+\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{1,2}(?::\d{2})?\s*[ap]m\s+(?:\d{1,2}\/\d{1,2}|\d{4}-\d{1,2}-\d{1,2})|\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{3,4})$/i
-      ];
-      
-      let eventName = nameAndTime;
-      let timeInput = 'tomorrow 8pm'; // Default fallback
-      
-      // Try to extract time information
-      for (const pattern of timePatterns) {
-        const match = nameAndTime.match(pattern);
-        if (match) {
-          timeInput = match[1];
-          eventName = nameAndTime.replace(pattern, '').trim();
-          break;
-        }
-      }
-      
-      // Get user timezone, fallback to UTC
-      const timezone = userTimezones.get(user.id) || 'UTC';
-      
-      try {
-        // Validate timezone
-        if (!moment.tz.zone(timezone)) {
-          return interaction.reply({ 
-            content: `❌ Your timezone is not set. Please use /set-timezone first.`, 
-            ephemeral: true 
-          });
-        }
-        
-        // Parse time to timestamp
-        const timestamp = parseTimeString(timeInput, timezone);
-        
-        // Generate a unique ID for the event
-        const eventId = generateEventId();
-        
-        // Create the event with minimal info
-        const event = {
-          name: eventName,
-          description: `Quick event: ${eventName}`,
-          timestamp,
-          timezone,
-          createdBy: user.id,
-          createdAt: Date.now(),
-          participants: [],
-          maxParticipants: 0,
-          location: null,
-          color: '#5865F2'
-        };
-        
-        // Add to events store
-        events.set(eventId, event);
-        
-        // Save events to storage
-        await saveEvents();
-        
-        // Create embed for the event
-        const embed = createEventEmbed(eventId, event);
-        const buttons = createEventButtons(eventId, user.id);
-        
-        // Reply with the event details
-        await interaction.reply({
-          content: `✅ Quick event created! Event ID: **${eventId}**`,
-          embeds: [embed],
-          components: buttons ? [buttons] : []
-        });
-        
-        console.log(`Quick event ${eventId} created by ${user.tag} (${user.id})`);
-      } catch (error) {
-        console.error('Error creating quick event:', error);
-        await interaction.reply({ 
-          content: `❌ Error creating event: ${error.message}. Try a format like "Game Night tomorrow 8pm" or "Team Meeting at 3pm".`, 
-          ephemeral: true 
-        });
-      }
-    }
-    
-    // Create event command
-    if (commandName === 'create-event') {
-      // Security: Check permissions
-      if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageEvents) && 
-          !interaction.memberPermissions.has(PermissionFlagsBits.Administrator)) {
-        return interaction.reply({ 
-          content: '❌ You do not have permission to create events.',
-          ephemeral: true 
-        });
-      }
-      
-      // Security: Rate limiting for event creation specifically
-      if (!checkRateLimit(user.id, 'creation')) {
-        return interaction.reply({ 
-          content: '⚠️ You are creating events too quickly. Please wait a moment and try again.',
-          ephemeral: true 
-        });
-      }
-      
-      // Security: Sanitize all inputs
-      const name = sanitizeInput(interaction.options.getString('name'));
-      const timeInput = sanitizeInput(interaction.options.getString('time'));
-      
-      // Get optional fields with defaults
-      const description = interaction.options.getString('description') 
-                         ? sanitizeInput(interaction.options.getString('description')) 
-                         : `Event: ${name}`; // Default description
-      
-      const dateInput = interaction.options.getString('date')
-                       ? sanitizeInput(interaction.options.getString('date'))
-                       : null; // Will be parsed from timeInput if possible
-      
-      // Get user timezone if not specified, fallback to UTC
-      let timezone = interaction.options.getString('timezone')
-                    ? sanitizeInput(interaction.options.getString('timezone'))
-                    : userTimezones.get(user.id) || 'UTC';
-      
-      const location = interaction.options.getString('location') 
-                      ? sanitizeInput(interaction.options.getString('location')) 
-                      : null;
-      
-      const maxParticipants = Math.min(
-        Math.max(0, interaction.options.getInteger('max_participants') || 0),
-        1000 // Cap at 1000 participants as a safety measure
-      );
-      
-      const color = interaction.options.getString('color') || '#5865F2';
-      
-      // Input validation - ensure critical fields aren't empty after sanitization
-      if (!name || !timeInput) {
-        return interaction.reply({ 
-          content: '❌ Event name and time are required.',
-          ephemeral: true 
-        });
-      }
-      
-      try {
-        // Validate timezone
-        if (!moment.tz.zone(timezone)) {
-          return interaction.reply({ 
-            content: `❌ Invalid timezone "${timezone}". Please use a valid timezone like 'America/New_York' or 'Europe/London', or set your default timezone with /set-timezone.`, 
-            ephemeral: true 
-          });
-        }
-        
-        // Parse time to timestamp - use the enhanced parser for combined inputs
-        let timestamp;
-        if (dateInput) {
-          // If date is provided separately, use the original parser
-          timestamp = parseTimeInput(timeInput, dateInput, timezone);
-        } else {
-          // If no separate date, try to parse combined date-time
-          timestamp = parseTimeString(timeInput, timezone);
-        }
-        
-        // Generate a unique ID for the event
-        const eventId = generateEventId();
-        
-        // Create the event with minimum required fields and defaults for optional ones
-        const event = {
-          name,
-          description,
-          timestamp,
-          timezone,
-          createdBy: user.id,
-          createdAt: Date.now(),
-          participants: [],
-          maxParticipants,
-          location,
-          color
-        };
-        
-        // Add to events store
-        events.set(eventId, event);
-        
-        // Save events to storage
-        await saveEvents();
-        
-        // Create embed for the event
-        const embed = createEventEmbed(eventId, event);
-        const buttons = createEventButtons(eventId, user.id);
-        
-        // Reply with the event details
-        await interaction.reply({
-          content: `✅ Event created! Event ID: **${eventId}**`,
-          embeds: [embed],
-          components: buttons ? [buttons] : []
-        });
-        
-        console.log(`Event ${eventId} created by ${user.tag} (${user.id})`);
-      } catch (error) {
-        console.error('Error creating event:', error);
-        await interaction.reply({ 
-          content: `❌ Error creating event: ${error.message}. Use format like "8pm tomorrow" or "3:14PM" or "May 20 3pm".`, 
-          ephemeral: true 
-        });
-      }
-    }
-    
-    // List events command
-    if (commandName === 'list-events') {
-      if (events.size === 0) {
-        return interaction.reply('There are currently no scheduled events.');
-      }
-      
-      // Sort events by timestamp (soonest first)
-      const sortedEvents = Array.from(events.entries())
-        .sort((a, b) => a[1].timestamp - b[1].timestamp);
-      
-      // Create an embed with upcoming events
-      const embed = new EmbedBuilder()
-        .setTitle('📅 Upcoming Events')
-        .setColor('#5865F2')
-        .setDescription('Here are all upcoming events. Use `/event id:<event_id>` to see details for a specific event.');
-      
-      const now = Math.floor(Date.now() / 1000);
-      let upcomingCount = 0;
-      
-      // Add upcoming events to embed
-      for (const [id, event] of sortedEvents) {
-        // Skip events that have already passed
-        if (event.timestamp < now) continue;
-        
-        upcomingCount++;
-        
-        // Add field for this event
-        embed.addFields({
-          name: `${event.name} (ID: ${id})`,
-          value: `📆 <t:${event.timestamp}:F> (<t:${event.timestamp}:R>)\n` +
-                `👥 ${event.participants.length} attending` +
-                `${event.location ? `\n📍 ${event.location}` : ''}`
-        });
-        
-        // Discord has a limit of 25 fields per embed
-        if (upcomingCount >= 25) break;
-      }
-      
-      if (upcomingCount === 0) {
-        embed.setDescription('There are no upcoming events scheduled.');
-      }
-      
-      await interaction.reply({ embeds: [embed] });
-    }
-    
-    // Event details command
-   if (commandName === 'event') {
-    const eventId = sanitizeInput(interaction.options.getString('id'));
-    
-    if (!events.has(eventId)) {
-      return interaction.reply({ 
-        content: `❌ Event with ID **${eventId}** not found.`, 
-        ephemeral: true 
-      });
-    }
-    
-    const event = events.get(eventId);
-    
-    // Create embed for the event
-    const embed = createEventEmbed(eventId, event);
-    const buttons = createEventButtons(eventId, user.id);
-    
-    // Reply with the event details
-    await interaction.reply({
-      embeds: [embed],
-      components: buttons ? [buttons] : []
-    });
-  }
-  
-  // Delete event command
-  if (commandName === 'delete-event') {
-    const eventId = sanitizeInput(interaction.options.getString('id'));
-    
-    if (!events.has(eventId)) {
-      return interaction.reply({ 
-        content: `❌ Event with ID **${eventId}** not found.`, 
-        ephemeral: true 
-      });
-    }
-    
-    const event = events.get(eventId);
-    
-    // Check if user is the creator or has admin permissions
-    if (event.createdBy !== user.id && 
-        !interaction.memberPermissions.has(PermissionFlagsBits.Administrator)) {
-      return interaction.reply({ 
-        content: `❌ You don't have permission to delete this event. Only the event creator or server administrators can delete events.`, 
-        ephemeral: true 
-      });
-    }
-    
-    // Delete the event
-    events.delete(eventId);
-    
-    // Save events to storage
-    await saveEvents();
-    
-    // Confirm deletion
-    await interaction.reply({ 
-      content: `✅ Event **${event.name}** (ID: ${eventId}) has been deleted.` 
-    });
-    
-    console.log(`Event ${eventId} deleted by ${user.tag} (${user.id})`);
-  }
-  
-  // Edit event command
-  if (commandName === 'edit-event') {
-    const eventId = sanitizeInput(interaction.options.getString('id'));
-    
-    if (!events.has(eventId)) {
-      return interaction.reply({ 
-        content: `❌ Event with ID **${eventId}** not found.`, 
-        ephemeral: true 
-      });
-    }
-    
-    const event = events.get(eventId);
-    
-    // Check if user is the creator or has admin permissions
-    if (event.createdBy !== user.id && 
-        !interaction.memberPermissions.has(PermissionFlagsBits.Administrator)) {
-      return interaction.reply({ 
-        content: `❌ You don't have permission to edit this event. Only the event creator or server administrators can edit events.`, 
-        ephemeral: true 
-      });
-    }
-    
-    try {
-      // Get new values or use existing ones
-      const name = interaction.options.getString('name') ? 
-                   sanitizeInput(interaction.options.getString('name')) : event.name;
-      const description = interaction.options.getString('description') ? 
-                         sanitizeInput(interaction.options.getString('description')) : event.description;
-      const timeInput = interaction.options.getString('time') ? 
-                        sanitizeInput(interaction.options.getString('time')) : null;
-      const dateInput = interaction.options.getString('date') ? 
-                        sanitizeInput(interaction.options.getString('date')) : null;
-      const timezone = interaction.options.getString('timezone') ? 
-                       sanitizeInput(interaction.options.getString('timezone')) : event.timezone;
-      const location = interaction.options.getString('location') !== null ? 
-                      sanitizeInput(interaction.options.getString('location')) : event.location;
-      const maxParticipants = interaction.options.getInteger('max_participants') !== null ? 
-                            Math.min(Math.max(0, interaction.options.getInteger('max_participants')), 1000) : event.maxParticipants;
-      
-      // Validate timezone
-      if (!moment.tz.zone(timezone)) {
-        return interaction.reply({ 
-          content: `❌ Invalid timezone. Please use a valid timezone like 'America/New_York' or 'Europe/London'.`, 
-          ephemeral: true 
-        });
-      }
-      
-      // Update timestamp if time or date was provided
-      let timestamp = event.timestamp;
-      if (timeInput || dateInput) {
-        if (timeInput && dateInput) {
-          // Both provided
-          timestamp = parseTimeInput(timeInput, dateInput, timezone);
-        } else if (timeInput) {
-          // Only time provided - try to parse as combined or use existing date
-          try {
-            timestamp = parseTimeString(timeInput, timezone);
-          } catch (error) {
-            // If combined parsing fails, use existing date
-            const existingDate = moment.unix(event.timestamp).tz(timezone).format('YYYY-MM-DD');
-            timestamp = parseTimeInput(timeInput, existingDate, timezone);
+     
+        // "In X time" command
+        if (commandName === 'in') {
+          // Security: Sanitize and validate inputs
+          const amount = Math.min(Math.max(1, interaction.options.getInteger('amount')), 1000);
+          const unit = interaction.options.getString('unit');
+          
+          const validUnits = ['minutes', 'hours', 'days', 'weeks', 'months'];
+          if (!validUnits.includes(unit)) {
+            return interaction.reply({ 
+              content: '❌ Invalid time unit.', 
+              ephemeral: true 
+            });
           }
-        } else if (dateInput) {
-          // Only date provided - use existing time
-          const existingTime = moment.unix(event.timestamp).tz(timezone).format('HH:mm');
-          timestamp = parseTimeInput(existingTime, dateInput, timezone);
+          
+          const now = moment();
+          const futureTime = now.add(amount, unit);
+          const unixTimestamp = Math.floor(futureTime.valueOf() / 1000);
+          
+          const response = [
+            `**Timestamp ${amount} ${unit} from now**: <t:${unixTimestamp}:F> (\`<t:${unixTimestamp}:F>\`)`,
+            `**Relative**: <t:${unixTimestamp}:R> (\`<t:${unixTimestamp}:R>\`)`,
+            `**Unix Timestamp**: \`${unixTimestamp}\``
+          ].join('\n');
+          
+          return interaction.reply(response);
         }
-      }
-      
-      // Update the event
-      const updatedEvent = {
-        ...event,
-        name,
-        description,
-        timestamp,
-        timezone,
-        location,
-        maxParticipants,
-        updatedAt: Date.now(),
-        updatedBy: user.id
-      };
-      
-      events.set(eventId, updatedEvent);
-      
-      // Save events to storage
-      await saveEvents();
-      
-      // Create embed for the updated event
-      const embed = createEventEmbed(eventId, updatedEvent);
-      const buttons = createEventButtons(eventId, user.id);
-      
-      // Reply with the updated event details
-      await interaction.reply({
-        content: `✅ Event updated successfully!`,
-        embeds: [embed],
-        components: buttons ? [buttons] : []
-      });
-      
-      console.log(`Event ${eventId} edited by ${user.tag} (${user.id})`);
-    } catch (error) {
-      console.error('Error editing event:', error);
-      await interaction.reply({ 
-        content: `❌ Error editing event: ${error.message}`, 
-        ephemeral: true 
-      });
-    }
-  }
-} catch (error) {
-  // Centralized error handling
-  console.error(`Command error in ${interaction.commandName}:`, error);
-  try {
-    // Only reply if interaction hasn't been replied to yet
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ 
-        content: 'An error occurred while processing your request. Please try again later.', 
-        ephemeral: true 
-      });
-    }
-  } catch (replyError) {
-    console.error('Error sending error response:', replyError);
-  }
-}
-});
+     
+        // Main timestamp command
+        if (commandName === 'timestamp') {
+          // Security: Sanitize all inputs
+          const timeInput = sanitizeInput(interaction.options.getString('time'));
+          const format = sanitizeInput(interaction.options.getString('format')) || 'f';
+          let dateInput = interaction.options.getString('date') ? 
+                         sanitizeInput(interaction.options.getString('date')) : null;
+          let timezone = interaction.options.getString('timezone') ? 
+                        sanitizeInput(interaction.options.getString('timezone')) : null;
+          
+          // Validate format
+          const validFormats = ['t', 'T', 'd', 'D', 'f', 'F', 'R', 'all'];
+          if (!validFormats.includes(format)) {
+            return interaction.reply({
+              content: '❌ Invalid format specified.',
+              ephemeral: true
+            });
+          }
+          
+          // If no timezone provided, use the user's saved timezone or default to UTC
+          if (!timezone) {
+            timezone = userTimezones.get(user.id) || 'UTC';
+          }
+          let resolvedTimezoneForParsing = resolveTimezoneAlias(timezone);
+          
+          try {
+            // Validate timezone
+            if (!moment.tz.zone(resolvedTimezoneForParsing)) {
+              return interaction.reply({ 
+                content: `❌ Invalid timezone. Please use a valid timezone like 'America/New_York', 'PST', 'EST', or 'UTC'.`, 
+                ephemeral: true 
+              });
+            }
+            
+            // Try parsing with combined date-time format first
+            let unixTimestamp;
+            if (!dateInput && timeInput !== 'now' && !/^\\d+$/.test(timeInput)) {
+              // This might be a combined format like "tomorrow 8pm"
+              try {
+                unixTimestamp = parseTimeString(timeInput, resolvedTimezoneForParsing);
+              } catch (error) {
+                // If combined parsing fails, fall back to separate parsing
+                unixTimestamp = parseTimeInput(timeInput, dateInput, resolvedTimezoneForParsing);
+              }
+            } else {
+              // Use regular parsing for explicit date input or special cases
+              unixTimestamp = parseTimeInput(timeInput, dateInput, resolvedTimezoneForParsing);
+            }
+            
+            if (format === 'all') {
+              // Show all format options
+              const formats = ['t', 'T', 'd', 'D', 'f', 'F', 'R'];
+              const examples = formats.map(f => `**${formatName(f)}**: <t:${unixTimestamp}:${f}> (\\\`<t:${unixTimestamp}:${f}>\\\`)`);
+              
+              const timezoneName = resolvedTimezoneForParsing || 'UTC';
+              const response = [
+                `**Time in ${timezoneName}**: ${moment.unix(unixTimestamp).tz(timezoneName).format('YYYY-MM-DD HH:mm:ss')}`,
+                `**Unix Timestamp**: \\\`${unixTimestamp}\\\``,
+                '**Discord Timestamp Formats**:',
+                ...examples
+              ].join('\n');
+              
+              return interaction.reply(response);
+            }
+            
+            // Generate timestamp for a specific format
+            const discordTimestamp = `<t:${unixTimestamp}:${format}>`;
+            const timezoneName = resolvedTimezoneForParsing || 'UTC';
+            const localTime = moment.unix(unixTimestamp).tz(timezoneName).format('YYYY-MM-DD HH:mm:ss');
+            
+            const response = [
+              `**Time in ${timezoneName}**: ${localTime}`,
+              `**${formatName(format)}**: ${discordTimestamp}`,
+              `**Copy this**: \`${discordTimestamp}\``,
+              `**Unix Timestamp**: \`${unixTimestamp}\``
+            ].join('\n');
+            
+            await interaction.reply(response);
+          } catch (error) {
+            console.error('Error generating timestamp:', error);
+            await interaction.reply({ 
+              content: `❌ Invalid time or date format. Examples of supported time formats:\n` +
+                      `- 3:14AM, 3:14 PM, 3PM, 3 PM\n` +
+                      `- 15:23 (24-hour format)\n` +
+                      `- 1520 (military time, no colon)\n` +
+                      `- now (current time)\n\n` +
+                      `Supported date formats:\n` +
+                      `- YYYY-MM-DD (e.g., 2023-05-20)\n` +
+                      `- MM/DD/YYYY (e.g., 05/20/2023)\n` +
+                      `- today, tomorrow, yesterday\n\n` +
+                      `Combined formats:\n` +
+                      `- tomorrow 8pm\n` +
+                      `- 3pm tomorrow`, 
+              ephemeral: true 
+            });
+          }
+        }
+        
+        // Test DM command
+        if (commandName === 'test-dm') {
+          const eventId = sanitizeInput(interaction.options.getString('event_id'));
+          const user = interaction.user;
 
-// Process errors globally to prevent crashes
-process.on('uncaughtException', (error) => {
-console.error('Uncaught Exception:', error);
-});
+          if (!events.has(eventId)) {
+            return interaction.reply({
+              content: `❌ Event with ID **${eventId}** not found.`,
+              ephemeral: true
+            });
+          }
 
-process.on('unhandledRejection', (error) => {
-console.error('Unhandled Promise Rejection:', error);
-});
+          const event = events.get(eventId);
 
-// Log in to Discord with error handling
-client.login(process.env.TOKEN).catch(error => {
-console.error('Failed to login to Discord:', error);
-process.exit(1);
-});
+          try {
+            const testEmbed = new EmbedBuilder()
+              .setTitle(`🧪 Test DM for: ${event.name}`)
+              .setDescription(`This is a test message to ensure you can receive DMs for event reminders and notifications.\\nEvent Time: <t:${event.timestamp}:F> (<t:${event.timestamp}:R>)`)
+              .setColor('#A020F0') // Using a distinct color for test DMs
+              .setFooter({ text: `Event ID: ${eventId} • Test DM` });
+            
+            await user.send({ embeds: [testEmbed] });
+            
+            await interaction.reply({
+              content: `✅ A test DM has been sent to you for event **${event.name}**. Please check your DMs.`,
+              ephemeral: true
+            });
+            console.log(`Sent test DM to ${user.tag} for event ${eventId}`);
+          } catch (error) {
+            console.error(`Failed to send test DM to ${user.id} for event ${eventId}:`, error);
+            await interaction.reply({
+              content: `❌ Could not send you a test DM. Please ensure your DMs are enabled for members of this server. Error: ${error.message}`,
+              ephemeral: true
+            });
+          }
+        }
+        
+        // Force Reminder Command
+        if (commandName === 'force-reminder') {
+          const eventId = sanitizeInput(interaction.options.getString('event_id'));
+          const user = interaction.user;
+
+          if (!events.has(eventId)) {
+            return interaction.reply({
+              content: `❌ Event with ID **${eventId}** not found.`,
+              ephemeral: true
+            });
+          }
+
+          const event = events.get(eventId);
+
+          // Check permissions: User must be an Administrator or the event creator
+          if (!interaction.memberPermissions.has(PermissionFlagsBits.Administrator) && event.createdBy !== user.id) {
+            return interaction.reply({
+              content: '❌ You do not have permission to use this command. Only server administrators or the event creator can force reminders.',
+              ephemeral: true
+            });
+          }
+
+          if (!event.participants || event.participants.length === 0) {
+            return interaction.reply({
+              content: `ℹ️ Event **${event.name}** has no participants to remind.`,
+              ephemeral: true
+            });
+          }
+
+          try {
+            const reminderEmbed = new EmbedBuilder()
+              .setTitle(`🔔 Ad-hoc Reminder: ${event.name}`)
+              .setDescription(`This is a manually triggered reminder for the event. It starts <t:${event.timestamp}:R>.
+${event.description || ''}`)
+              .setColor(event.color || '#FF9900') // Using reminder color or event color
+              .addFields(
+                { name: 'Event Time', value: `<t:${event.timestamp}:F>`, inline: true }
+              );
+
+            if (event.location) {
+              reminderEmbed.addFields({ name: 'Location', value: event.location, inline: true });
+            }
+            reminderEmbed.setFooter({ text: `Event ID: ${eventId}` });
+
+            let successCount = 0;
+            let failCount = 0;
+
+            for (const participantId of event.participants) {
+              try {
+                const participantUser = await client.users.fetch(participantId);
+                await participantUser.send({ embeds: [reminderEmbed] });
+                successCount++;
+              } catch (dmError) {
+                failCount++;
+                console.error(`Failed to send forced reminder to user ${participantId} for event ${eventId}:`, dmError);
+              }
+            }
+
+            await interaction.reply({
+              content: `✅ Manually sent reminders for **${event.name}**.\nSuccessfully sent to ${successCount} participant(s).\nFailed to send to ${failCount} participant(s) (they may have DMs disabled).`,
+              ephemeral: true
+            });
+            console.log(`Forced reminders for event ${eventId} triggered by ${user.tag}. Success: ${successCount}, Failed: ${failCount}`);
+
+          } catch (error) {
+            console.error(`Error sending forced reminders for event ${eventId}:`, error);
+            await interaction.reply({
+              content: '❌ An error occurred while trying to send forced reminders.',
+              ephemeral: true
+            });
+          }
+        }
+        
+        // Quick event command
+        if (commandName === 'quick-event') {
+          // Security: Check permissions
+          if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageEvents) && 
+              !interaction.memberPermissions.has(PermissionFlagsBits.Administrator)) {
+            return interaction.reply({ 
+              content: '❌ You do not have permission to create events.',
+              ephemeral: true 
+            });
+          }
+          
+          const nameAndTime = sanitizeInput(interaction.options.getString('name_and_time'));
+          const mentionUser = interaction.options.getUser('mention'); // Get the user to mention
+          
+          // Try to parse the combined string into name and time
+          // Common patterns: "Game Night tomorrow 8pm", "Team Meeting at 3pm", etc.
+          const timePatterns = [
+            // Look for time patterns at the end
+            /\b((?:today|tomorrow|yesterday|in \d+ (?:minute|hour|day|week|month)s?|next (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))(?:\s+at)?\s+\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{1,2}(?::\d{2})?\s*[ap]m\s+(?:today|tomorrow|yesterday)|(?:\d{1,2}\/\d{1,2}|\d{4}-\d{1,2}-\d{1,2})\s+\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{1,2}(?::\d{2})?\s*[ap]m\s+(?:\d{1,2}\/\d{1,2}|\d{4}-\d{1,2}-\d{1,2})|\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{3,4})$/i
+          ];
+          
+          let eventName = nameAndTime;
+          let timeInput = 'tomorrow 8pm'; // Default fallback
+          
+          // Try to extract time information
+          for (const pattern of timePatterns) {
+            const match = nameAndTime.match(pattern);
+            if (match) {
+              timeInput = match[1];
+              eventName = nameAndTime.replace(pattern, '').trim();
+              break;
+            }
+          }
+          
+          // Get user timezone, fallback to UTC
+          const timezone = userTimezones.get(user.id) || 'UTC';
+          const resolvedTimezone = resolveTimezoneAlias(timezone);
+          
+          try {
+            // Validate timezone
+            if (!moment.tz.zone(resolvedTimezone)) {
+              return interaction.reply({ 
+                content: `❌ Your timezone is not set or is invalid ('${timezone}'). Please use /set-timezone first with a valid IANA name or common alias (e.g., EST, PST).`, 
+                ephemeral: true 
+              });
+            }
+            
+            // Parse time to timestamp
+            const timestamp = parseTimeString(timeInput, resolvedTimezone);
+            
+            // Generate a unique ID for the event
+            const eventId = generateEventId();
+            
+            // Create the event with minimal info
+            const event = {
+              name: eventName,
+              description: `Quick event: ${eventName}`,
+              timestamp,
+              timezone,
+              createdBy: user.id,
+              createdAt: Date.now(),
+              participants: [],
+              maxParticipants: 0,
+              location: null,
+              mentionUserId: mentionUser ? mentionUser.id : null, // Store the user ID if provided
+              color: '#5865F2',
+              startNotified: false, // Initialize startNotified
+              channelId: interaction.channelId // Store channelId on creation
+            };
+            
+            // Add to events store
+            events.set(eventId, event);
+            
+            // Save events to storage
+            await saveEvents();
+            
+            // Create embed for the event
+            const embed = createEventEmbed(eventId, event);
+            const buttons = createEventButtons(eventId); // No longer passing userId
+            
+            // Prepare content with mention if a role was specified
+            let content = `✅ Quick event created! Event ID: **${eventId}**`;
+            if (mentionUser) {
+              content = `<@${mentionUser.id}> ${content}`;
+            }
+            
+            // Reply with the event details
+            await interaction.reply({
+              content: content,
+              embeds: [embed],
+              components: buttons ? [buttons] : []
+            });
+            
+            console.log(`Quick event ${eventId} created by ${user.tag} (${user.id})`);
+          } catch (error) {
+            console.error('Error creating quick event:', error);
+            await interaction.reply({ 
+              content: `❌ Error creating event: ${error.message}. Try a format like "Game Night tomorrow 8pm" or "Team Meeting at 3pm".`, 
+              ephemeral: true 
+            });
+          }
+        }
+        
+        // Create event command
+        if (commandName === 'create-event') {
+          // Security: Check permissions
+          if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageEvents) && 
+              !interaction.memberPermissions.has(PermissionFlagsBits.Administrator)) {
+            return interaction.reply({ 
+              content: '❌ You do not have permission to create events.',
+              ephemeral: true 
+            });
+          }
+          
+          // Security: Rate limiting for event creation specifically
+          if (!checkRateLimit(user.id, 'creation')) {
+            return interaction.reply({ 
+              content: '⚠️ You are creating events too quickly. Please wait a moment and try again.',
+              ephemeral: true 
+            });
+          }
+          
+          // Security: Sanitize all inputs
+          const name = sanitizeInput(interaction.options.getString('name'));
+          const timeInput = sanitizeInput(interaction.options.getString('time'));
+          
+          // Get optional fields with defaults
+          const description = interaction.options.getString('description') 
+                             ? sanitizeInput(interaction.options.getString('description')) 
+                             : `Event: ${name}`; // Default description
+          
+          const dateInput = interaction.options.getString('date')
+                           ? sanitizeInput(interaction.options.getString('date'))
+                           : null; // Will be parsed from timeInput if possible
+          
+          // Get user timezone if not specified, fallback to UTC
+          let timezone = interaction.options.getString('timezone')
+                        ? sanitizeInput(interaction.options.getString('timezone'))
+                        : userTimezones.get(user.id) || 'UTC';
+          
+          const location = interaction.options.getString('location') 
+                          ? sanitizeInput(interaction.options.getString('location')) 
+                          : null;
+          
+          const maxParticipants = Math.min(
+            Math.max(0, interaction.options.getInteger('max_participants') || 0),
+            1000 // Cap at 1000 participants as a safety measure
+          );
+          
+          const mentionUser = interaction.options.getUser('mention'); // Get the user to mention
+          const color = interaction.options.getString('color') || '#5865F2';
+          
+          // Input validation - ensure critical fields aren't empty after sanitization
+          if (!name || !timeInput) {
+            return interaction.reply({ 
+              content: '❌ Event name and time are required.',
+              ephemeral: true 
+            });
+          }
+          
+          try {
+            // Validate timezone
+            const resolvedTimezone = resolveTimezoneAlias(timezone);
+            if (!moment.tz.zone(resolvedTimezone)) {
+              return interaction.reply({ 
+                content: `❌ Invalid timezone "${timezone}". Please use a valid IANA timezone name or a common alias (e.g., America/New_York, PST, EST, UTC).`, 
+                ephemeral: true 
+              });
+            }
+            
+            // Parse time to timestamp - use the enhanced parser for combined inputs
+            let timestamp;
+            if (dateInput) {
+              // If date is provided separately, use the original parser
+              timestamp = parseTimeInput(timeInput, dateInput, resolvedTimezone);
+            } else {
+              // If no separate date, try to parse combined date-time
+              timestamp = parseTimeString(timeInput, resolvedTimezone);
+            }
+            
+            // Generate a unique ID for the event
+            const eventId = generateEventId();
+            
+            // Create the event with minimum required fields and defaults for optional ones
+            const event = {
+              name,
+              description,
+              timestamp,
+              timezone,
+              createdBy: user.id,
+              createdAt: Date.now(),
+              participants: [],
+              maxParticipants,
+              location,
+              mentionUserId: mentionUser ? mentionUser.id : null, // Store the user ID if provided
+              color,
+              startNotified: false, // Initialize startNotified
+              channelId: interaction.channelId // Store channelId on creation
+            };
+            
+            // Add to events store
+            events.set(eventId, event);
+            
+            // Save events to storage
+            await saveEvents();
+            
+            // Create embed for the event
+            const embed = createEventEmbed(eventId, event);
+            const buttons = createEventButtons(eventId); // No longer passing userId
+            
+            // Prepare content with mention if a role was specified
+            let content = `✅ Event created! Event ID: **${eventId}**`;
+            if (mentionUser) {
+              content = `<@${mentionUser.id}> ${content}`;
+            }
+            
+            // Reply with the event details
+            await interaction.reply({
+              content: content,
+              embeds: [embed],
+              components: buttons ? [buttons] : []
+            });
+            
+            console.log(`Event ${eventId} created by ${user.tag} (${user.id})`);
+          } catch (error) {
+            console.error('Error creating event:', error);
+            await interaction.reply({ 
+              content: `❌ Error creating event: ${error.message}. Use format like "8pm tomorrow" or "3:14PM" or "May 20 3pm".`, 
+              ephemeral: true 
+            });
+          }
+        }
+        
+        // List events command
+        if (commandName === 'list-events') {
+          if (events.size === 0) {
+            return interaction.reply('There are currently no scheduled events.');
+          }
+          
+          // Sort events by timestamp (soonest first)
+          const sortedEvents = Array.from(events.entries())
+            .sort((a, b) => a[1].timestamp - b[1].timestamp);
+          
+          // Create an embed with upcoming events
+          const embed = new EmbedBuilder()
+            .setTitle('📅 Upcoming Events')
+            .setColor('#5865F2')
+            .setDescription('Here are all upcoming events. Use `/event id:<event_id>` to see details for a specific event.');
+          
+            const now = Math.floor(Date.now() / 1000);
+            let upcomingCount = 0;
+            
+            // Add upcoming events to embed
+            for (const [id, event] of sortedEvents) {
+              // Skip events that have already passed
+              if (event.timestamp < now) continue;
+              
+              upcomingCount++;
+              
+              // Add field for this event
+              embed.addFields({
+                name: `${event.name} (ID: ${id})`,
+                value: `📆 <t:${event.timestamp}:F> (<t:${event.timestamp}:R>)\n` +
+                      `👥 ${event.participants.length} attending` +
+                      `${event.location ? `\n📍 ${event.location}` : ''}`
+              });
+              
+              // Discord has a limit of 25 fields per embed
+              if (upcomingCount >= 25) break;
+            }
+            
+            if (upcomingCount === 0) {
+              embed.setDescription('There are no upcoming events scheduled.');
+            }
+            
+            await interaction.reply({ embeds: [embed] });
+          }
+          
+          // Event details command
+          if (commandName === 'event') {
+            const eventId = sanitizeInput(interaction.options.getString('id'));
+            
+            if (!events.has(eventId)) {
+              return interaction.reply({ 
+                content: `❌ Event with ID **${eventId}** not found.`, 
+                ephemeral: true 
+              });
+            }
+            
+            const event = events.get(eventId);
+            
+            // Create embed for the event
+            const embed = createEventEmbed(eventId, event);
+            const buttons = createEventButtons(eventId); // No longer passing userId
+            
+            // Check if the event has a role to mention
+            let content = null;
+            if (event.mentionUserId) { // Changed from mentionRoleId
+              content = `<@${event.mentionUserId}>`; // Format for user mention
+            }
+            
+            // Reply with the event details
+            await interaction.reply({
+              content: content,
+              embeds: [embed],
+              components: buttons ? [buttons] : []
+            });
+          }
+          
+          // Delete event command
+          if (commandName === 'delete-event') {
+            const eventId = sanitizeInput(interaction.options.getString('id'));
+            
+            if (!events.has(eventId)) {
+              return interaction.reply({ 
+                content: `❌ Event with ID **${eventId}** not found.`, 
+                ephemeral: true 
+              });
+            }
+            
+            const event = events.get(eventId);
+            
+            // Check if user is the creator or has admin permissions
+            if (event.createdBy !== user.id && 
+                !interaction.memberPermissions.has(PermissionFlagsBits.Administrator)) {
+              return interaction.reply({ 
+                content: `❌ You don't have permission to delete this event. Only the event creator or server administrators can delete events.`, 
+                ephemeral: true 
+              });
+            }
+            
+            // Delete the event
+            events.delete(eventId);
+            
+            // Save events to storage
+            await saveEvents();
+            
+            // Confirm deletion
+            await interaction.reply({ 
+              content: `✅ Event **${event.name}** (ID: ${eventId}) has been deleted.` 
+            });
+            
+            console.log(`Event ${eventId} deleted by ${user.tag} (${user.id})`);
+          }
+          
+          // Edit event command
+          if (commandName === 'edit-event') {
+            const eventId = sanitizeInput(interaction.options.getString('id'));
+            
+            if (!events.has(eventId)) {
+              return interaction.reply({ 
+                content: `❌ Event with ID **${eventId}** not found.`, 
+                ephemeral: true 
+              });
+            }
+            
+            const event = events.get(eventId);
+            
+            // Check if user is the creator or has admin permissions
+            if (event.createdBy !== user.id && 
+                !interaction.memberPermissions.has(PermissionFlagsBits.Administrator)) {
+              return interaction.reply({ 
+                content: `❌ You don't have permission to edit this event. Only the event creator or server administrators can edit events.`, 
+                ephemeral: true 
+              });
+            }
+            
+            try {
+              // Get new values or use existing ones
+              const name = interaction.options.getString('name') ? 
+                           sanitizeInput(interaction.options.getString('name')) : event.name;
+              const description = interaction.options.getString('description') ? 
+                                 sanitizeInput(interaction.options.getString('description')) : event.description;
+              const timeInput = interaction.options.getString('time') ? 
+                                sanitizeInput(interaction.options.getString('time')) : null;
+              const dateInput = interaction.options.getString('date') ? 
+                                sanitizeInput(interaction.options.getString('date')) : null;
+              const timezone = interaction.options.getString('timezone') ? 
+                               sanitizeInput(interaction.options.getString('timezone')) : event.timezone;
+              const location = interaction.options.getString('location') !== null ? 
+                              sanitizeInput(interaction.options.getString('location')) : event.location;
+              const maxParticipants = interaction.options.getInteger('max_participants') !== null ? 
+                                    Math.min(Math.max(0, interaction.options.getInteger('max_participants')), 1000) : event.maxParticipants;
+              const mentionUser = interaction.options.getUser('mention'); // Get the user to mention
+              
+              // Validate timezone
+              if (!moment.tz.zone(timezone)) {
+                return interaction.reply({ 
+                  content: `❌ Invalid timezone. Please use a valid timezone like 'America/New_York' or 'Europe/London'.`, 
+                  ephemeral: true 
+                });
+              }
+              
+              // Update timestamp if time or date was provided
+              let timestamp = event.timestamp;
+              if (timeInput || dateInput) {
+                if (timeInput && dateInput) {
+                  // Both provided
+                  timestamp = parseTimeInput(timeInput, dateInput, timezone);
+                } else if (timeInput) {
+                  // Only time provided - try to parse as combined or use existing date
+                  try {
+                    timestamp = parseTimeString(timeInput, timezone);
+                  } catch (error) {
+                    // If combined parsing fails, use existing date
+                    const existingDate = moment.unix(event.timestamp).tz(timezone).format('YYYY-MM-DD');
+                    timestamp = parseTimeInput(timeInput, existingDate, timezone);
+                  }
+                } else if (dateInput) {
+                  // Only date provided - use existing time
+                  const existingTime = moment.unix(event.timestamp).tz(timezone).format('HH:mm');
+                  timestamp = parseTimeInput(existingTime, dateInput, timezone);
+                }
+              }
+              
+              // Update the event
+              const updatedEvent = {
+                ...event,
+                name,
+                description,
+                timestamp,
+                timezone,
+                location,
+                maxParticipants,
+                mentionUserId: mentionUser ? mentionUser.id : event.mentionUserId, // Update user ID if provided
+                updatedAt: Date.now(),
+                updatedBy: user.id,
+                // channelId typically doesn't change on edit unless explicitly added as an option
+                // For now, retain existing channelId
+                channelId: event.channelId 
+              };
+              
+              events.set(eventId, updatedEvent);
+              
+              // Save events to storage
+              await saveEvents();
+              
+              // Create embed for the updated event
+              const embed = createEventEmbed(eventId, updatedEvent);
+              const buttons = createEventButtons(eventId); // No longer passing userId
+              
+              // Prepare content with mention if a role was specified
+              let content = `✅ Event updated successfully!`;
+              if (mentionUser) { // If a new user is mentioned in the edit
+                content = `<@${mentionUser.id}> ${content}`;
+              } else if (updatedEvent.mentionUserId) { // If an existing user mention is on the event
+                content = `<@${updatedEvent.mentionUserId}> ${content}`;
+              }
+              
+              // Reply with the updated event details
+              await interaction.reply({
+                content: content,
+                embeds: [embed],
+                components: buttons ? [buttons] : []
+              });
+              
+              console.log(`Event ${eventId} edited by ${user.tag} (${user.id})`);
+            } catch (error) {
+              console.error('Error editing event:', error);
+              await interaction.reply({ 
+                content: `❌ Error editing event: ${error.message}`, 
+                ephemeral: true 
+              });
+            }
+          }
+        } catch (error) {
+          // Centralized error handling
+          console.error(`Command error in ${interaction.commandName}:`, error);
+          try {
+            // Only reply if interaction hasn't been replied to yet
+            if (!interaction.replied && !interaction.deferred) {
+              await interaction.reply({ 
+                content: 'An error occurred while processing your request. Please try again later.', 
+                ephemeral: true 
+              });
+            }
+          } catch (replyError) {
+            console.error('Error sending error response:', replyError);
+          }
+        }
+       });
+       
+       // Process errors globally to prevent crashes
+       process.on('uncaughtException', (error) => {
+        console.error('Uncaught Exception:', error);
+       });
+       
+       process.on('unhandledRejection', (error) => {
+        console.error('Unhandled Promise Rejection:', error);
+       });
+       
+       // Log in to Discord with error handling
+       client.login(process.env.TOKEN).catch(error => {
+        console.error('Failed to login to Discord:', error);
+        process.exit(1);
+       });
